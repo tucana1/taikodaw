@@ -3,6 +3,7 @@ export type HitType = "don" | "ka" | null;
 export interface Hit {
   type: HitType;
   volume: number; // 0-100
+  pitch: number; // 0-100: DON position (0=dead center/deepest, 100=near edge/brightest)
 }
 
 export interface Track {
@@ -24,7 +25,7 @@ export interface DAWProject {
 }
 
 function makeSteps(count: number): Hit[] {
-  return Array.from({ length: count }, () => ({ type: null, volume: 80 } as Hit));
+  return Array.from({ length: count }, () => ({ type: null, volume: 80, pitch: 50 } as Hit));
 }
 
 export function makeDefaultProject(): DAWProject {
