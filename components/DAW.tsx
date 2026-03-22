@@ -49,8 +49,42 @@ function resizeStepsForGrid(prev: Record<string, Hit[]>, tracks: Track[], newTot
   }
   return next;
 }
+function remapStepsForSubdivision(
+  prev: Record<string, Hit[]>,
+  tracks: Track[],
+  bars: number,
+  beatsPerBar: number,
+  oldSubdivision: number,
+  newSubdivision: number
+): Record<string, Hit[]> {
+  const nextTotal = bars * beatsPerBar * newSubdivision;
+  const next: Record<string, Hit[]> = {};
+  for (const track of tracks) {
+    const oldTrackSteps = prev[track.id] ?? [];
+    const newTrackSteps = makeSteps(nextTotal);
+    for (let bar = 0; bar < bars; bar++) {
+      for (let beat = 0; beat < beatsPerBar; beat++) {
+        for (let oldSub = 0; oldSub < oldSubdivision; oldSub++) {
+          const oldStepIndex = bar * beatsPerBar * oldSubdivision + beat * oldSubdivision + oldSub;
+          const source = oldTrackSteps[oldStepIndex];
+          if (!source || source.type === null) continue;
+          const newSub = Math.floor((oldSub * newSubdivision) / oldSubdivision);
+          const newStepIndex = bar * beatsPerBar * newSubdivision + beat * newSubdivision + newSub;
+          newTrackSteps[newStepIndex] = normaliseHit(source);
+        }
+      }
+    }
+    next[track.id] = newTrackSteps;
+  }
+  return next;
+}
 function normaliseHit(h: Hit): Hit {
   return { type: h.type, volume: h.volume ?? 80, pitch: h.pitch ?? 50 };
+}
+function getTrackOverrideStep(trackId: string, stepIndex: number, stepsPerBar: number, rhythmOverrides: Record<string, Record<number, number>>, baseSubdivision: number): number {
+  const barIndex = Math.floor(stepIndex / stepsPerBar);
+  const overrideSub = rhythmOverrides[trackId]?.[barIndex] ?? baseSubdivision;
+  return Math.max(1, Math.floor(baseSubdivision / overrideSub));
 }
 
 // StepButton
@@ -106,17 +140,21 @@ interface TrackRowProps {
   beatsPerBar: number;
   subdivision: number;
   selectedSteps: Set<number>;
+  isTrackSelected: boolean;
   onUpdateTrack: (updates: Partial<Track>) => void;
   onRemoveTrack: () => void;
+  onToggleTrackSelection: (e: React.MouseEvent) => void;
   onStepClick: (stepIndex: number, e: React.MouseEvent) => void;
   onContextMenu: (stepIndex: number, e: React.MouseEvent) => void;
+  isStepEditable: (stepIndex: number) => boolean;
 }
-function TrackRow({ track, color, trackSteps, playingStep, beatsPerBar, subdivision, selectedSteps, onUpdateTrack, onRemoveTrack, onStepClick, onContextMenu }: TrackRowProps) {
+function TrackRow({ track, color, trackSteps, playingStep, beatsPerBar, subdivision, selectedSteps, isTrackSelected, onUpdateTrack, onRemoveTrack, onToggleTrackSelection, onStepClick, onContextMenu, isStepEditable }: TrackRowProps) {
   return (
     <div className="flex border-b border-gray-800 group">
-      <div className="w-52 shrink-0 bg-gray-900 border-r border-gray-700 p-2 flex flex-col gap-1.5">
+      <div className={`w-52 shrink-0 bg-gray-900 border-r border-gray-700 p-2 flex flex-col gap-1.5 ${isTrackSelected ? "ring-1 ring-indigo-500 ring-inset" : ""}`}>
         <div className="flex items-center gap-1">
           <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: color }} />
+          <button onClick={onToggleTrackSelection} className={`px-1 py-0.5 rounded text-[10px] font-semibold border ${isTrackSelected ? "bg-indigo-700 border-indigo-500 text-indigo-100" : "bg-gray-800 border-gray-700 text-gray-400 hover:text-gray-200"}`} title="Select this part for copy/paste and rhythm edits">Part</button>
           <input type="text" value={track.name} onChange={(e) => onUpdateTrack({ name: e.target.value })} className="flex-1 bg-transparent text-sm font-semibold text-white outline-none min-w-0 truncate" />
           <button onClick={onRemoveTrack} className="text-gray-600 hover:text-red-400 text-xs px-0.5 shrink-0" title="Remove track">&#x2715;</button>
         </div>
@@ -135,6 +173,7 @@ function TrackRow({ track, color, trackSteps, playingStep, beatsPerBar, subdivis
             const beatInBar = beatIndex % beatsPerBar;
             const isBarStart = barIndex > 0 && beatInBar === 0 && subIndex === 0;
             const isBeatStart = beatInBar > 0 && subIndex === 0;
+            const editable = isStepEditable(stepIdx);
             return (
               <StepButton
                 key={stepIdx}
@@ -143,7 +182,7 @@ function TrackRow({ track, color, trackSteps, playingStep, beatsPerBar, subdivis
                 isBeatStart={isBeatStart}
                 isBarStart={isBarStart}
                 isSelected={selectedSteps.has(stepIdx)}
-                onClick={(e) => onStepClick(stepIdx, e)}
+                onClick={(e) => { if (editable) onStepClick(stepIdx, e); }}
                 onContextMenu={(e) => { if (hit.type !== null) { e.preventDefault(); onContextMenu(stepIdx, e); } }}
               />
             );
@@ -172,8 +211,11 @@ export default function DAW() {
 
   // selection
   const [selectedSteps, setSelectedSteps] = useState<Set<number>>(() => new Set<number>());
+  const [selectedTrackIds, setSelectedTrackIds] = useState<Set<string>>(() => new Set<string>(initialProject.tracks.map((t) => t.id)));
   const lastSelectedStepRef = useRef<number | null>(null);
-  const [clipboard, setClipboard] = useState<{ data: Record<string, Hit[]>; count: number } | null>(null);
+  const [clipboard, setClipboard] = useState<{ data: Record<string, Hit[]>; count: number; selectedOffsets: number[]; trackIds: string[] } | null>(null);
+  const [rhythmOverrides, setRhythmOverrides] = useState<Record<string, Record<number, number>>>(() => initialProject.rhythmOverrides ?? {});
+  const [repeatRange, setRepeatRange] = useState<{ start: number; end: number } | null>(null);
 
   // scheduler refs
   const isPlayingRef = useRef(false);
@@ -181,6 +223,7 @@ export default function DAW() {
   const currentStepRef = useRef(0);
   const schedulerIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const rafRef = useRef<number>(0);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
   const lastVisualStepRef = useRef(-1);
   const bpmRef = useRef(bpm);
   const stepsRef = useRef(steps);
@@ -189,6 +232,7 @@ export default function DAW() {
   const subdivisionRef = useRef(subdivision);
   const totalStepsRef = useRef(bars * beatsPerBar * subdivision);
   const loopingRef = useRef(looping);
+  const repeatRangeRef = useRef<{ start: number; end: number } | null>(repeatRange);
 
   useEffect(() => { bpmRef.current = bpm; }, [bpm]);
   useEffect(() => { stepsRef.current = steps; }, [steps]);
@@ -197,15 +241,16 @@ export default function DAW() {
   useEffect(() => { subdivisionRef.current = subdivision; }, [subdivision]);
   useEffect(() => { totalStepsRef.current = bars * beatsPerBar * subdivision; }, [bars, beatsPerBar, subdivision]);
   useEffect(() => { loopingRef.current = looping; }, [looping]);
+  useEffect(() => { repeatRangeRef.current = repeatRange; }, [repeatRange]);
 
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
-      saveProject({ bpm, beatsPerBar, noteValue, subdivision, bars, tracks, steps, masterVolume });
+      saveProject({ bpm, beatsPerBar, noteValue, subdivision, bars, tracks, steps, rhythmOverrides, masterVolume });
     }, 500);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-  }, [bpm, beatsPerBar, noteValue, subdivision, bars, tracks, steps, masterVolume]);
+  }, [bpm, beatsPerBar, noteValue, subdivision, bars, tracks, steps, rhythmOverrides, masterVolume]);
 
   const scheduleStep = useCallback((step: number, time: number) => {
     const ctx = getAudioContext();
@@ -232,7 +277,16 @@ export default function DAW() {
       scheduleStep(currentStepRef.current, nextStepTimeRef.current);
       nextStepTimeRef.current += secPerStep;
       currentStepRef.current += 1;
-      if (currentStepRef.current >= total) {
+      const repeat = repeatRangeRef.current;
+      if (repeat && currentStepRef.current > repeat.end) {
+        if (loopingRef.current) {
+          currentStepRef.current = repeat.start;
+        } else {
+          isPlayingRef.current = false;
+          currentStepRef.current = 0;
+          return;
+        }
+      } else if (currentStepRef.current >= total) {
         if (loopingRef.current) {
           currentStepRef.current = 0;
         } else {
@@ -247,7 +301,7 @@ export default function DAW() {
   const startPlayback = useCallback(async () => {
     await resumeAudio();
     const ctx = getAudioContext();
-    currentStepRef.current = 0;
+    currentStepRef.current = repeatRangeRef.current?.start ?? 0;
     nextStepTimeRef.current = ctx.currentTime + 0.05;
     lastVisualStepRef.current = -1;
     isPlayingRef.current = true;
@@ -288,17 +342,35 @@ export default function DAW() {
 
   const totalSteps = bars * beatsPerBar * subdivision;
   const stepsPerBar = beatsPerBar * subdivision;
+  const activeTrackIds = tracks.filter((t) => selectedTrackIds.has(t.id)).map((t) => t.id);
+  const effectiveTrackIds = activeTrackIds.length > 0 ? activeTrackIds : tracks.map((t) => t.id);
 
   const addTrack = useCallback(() => {
     const id = generateId();
     const newTrack: Track = { id, name: `Part ${tracks.length + 1}`, volume: 80, muted: false };
     setTracks((prev) => [...prev, newTrack]);
     setSteps((prev) => ({ ...prev, [id]: makeSteps(totalSteps) }));
+    setSelectedTrackIds((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
   }, [tracks.length, totalSteps]);
 
   const removeTrack = useCallback((trackId: string) => {
     setTracks((prev) => prev.filter((t) => t.id !== trackId));
     setSteps((prev) => { const next = { ...prev }; delete next[trackId]; return next; });
+    setSelectedTrackIds((prev) => {
+      const next = new Set(prev);
+      next.delete(trackId);
+      return next;
+    });
+    setRhythmOverrides((prev) => {
+      if (!prev[trackId]) return prev;
+      const next = { ...prev };
+      delete next[trackId];
+      return next;
+    });
   }, []);
 
   const updateTrack = useCallback((trackId: string, updates: Partial<Track>) => {
@@ -360,10 +432,12 @@ export default function DAW() {
         });
         lastSelectedStepRef.current = stepIndex;
       } else {
+        const skip = getTrackOverrideStep(trackId, stepIndex, stepsPerBar, rhythmOverrides, subdivision);
+        if (skip > 1 && stepIndex % skip !== 0) return;
         toggleStep(trackId, stepIndex);
       }
     },
-    [toggleStep]
+    [toggleStep, stepsPerBar, rhythmOverrides, subdivision]
   );
 
   const handleBarClick = useCallback(
@@ -429,34 +503,38 @@ export default function DAW() {
   const handleCopy = useCallback(() => {
     if (selectedSteps.size === 0) return;
     const sortedIndices = Array.from(selectedSteps).sort((a, b) => a - b);
+    const first = sortedIndices[0];
+    const selectedOffsets = sortedIndices.map((i) => i - first);
     const data: Record<string, Hit[]> = {};
-    for (const track of tracks) {
-      data[track.id] = sortedIndices.map((i) =>
-        normaliseHit(steps[track.id]?.[i] ?? { type: null, volume: 80, pitch: 50 })
+    for (const trackId of effectiveTrackIds) {
+      data[trackId] = selectedOffsets.map((offset) =>
+        normaliseHit(steps[trackId]?.[first + offset] ?? { type: null, volume: 80, pitch: 50 })
       );
     }
-    setClipboard({ data, count: sortedIndices.length });
-  }, [selectedSteps, tracks, steps]);
+    setClipboard({ data, count: sortedIndices.length, selectedOffsets, trackIds: effectiveTrackIds });
+  }, [selectedSteps, effectiveTrackIds, steps]);
 
   const handlePaste = useCallback(() => {
     if (!clipboard || selectedSteps.size === 0) return;
     const sortedTargets = Array.from(selectedSteps).sort((a, b) => a - b);
+    const firstTarget = sortedTargets[0];
+    const selectedTargetOffsets = new Set(sortedTargets.map((i) => i - firstTarget));
     setSteps((prev) => {
       const next: Record<string, Hit[]> = { ...prev };
-      for (const track of tracks) {
-        const trackSteps = [...(next[track.id] ?? [])];
-        const clipHits = clipboard.data[track.id] ?? [];
-        sortedTargets.forEach((targetIdx, pos) => {
-          const clipIdx = pos % clipboard.count;
-          if (targetIdx < trackSteps.length) {
+      for (const trackId of clipboard.trackIds) {
+        const trackSteps = [...(next[trackId] ?? [])];
+        const clipHits = clipboard.data[trackId] ?? [];
+        clipboard.selectedOffsets.forEach((offset, clipIdx) => {
+          const targetIdx = firstTarget + offset;
+          if (targetIdx < trackSteps.length && selectedTargetOffsets.has(offset)) {
             trackSteps[targetIdx] = { ...(clipHits[clipIdx] ?? normaliseHit({ type: null, volume: 80, pitch: 50 })) };
           }
         });
-        next[track.id] = trackSteps;
+        next[trackId] = trackSteps;
       }
       return next;
     });
-  }, [clipboard, selectedSteps, tracks]);
+  }, [clipboard, selectedSteps]);
 
   const handleSetBars = useCallback((newBars: number) => {
     const n = clamp(newBars, 1, 16);
@@ -464,21 +542,93 @@ export default function DAW() {
     setBars(n);
     setSteps((prev) => resizeStepsForGrid(prev, tracks, newTotal));
     setSelectedSteps(new Set<number>());
+    setRhythmOverrides((prev) => {
+      const next: Record<string, Record<number, number>> = {};
+      for (const track of tracks) {
+        const overrides = prev[track.id] ?? {};
+        const trimmed: Record<number, number> = {};
+        for (let i = 0; i < n; i++) {
+          const val = overrides[i];
+          if (val && val !== subdivision) trimmed[i] = val;
+        }
+        if (Object.keys(trimmed).length > 0) next[track.id] = trimmed;
+      }
+      return next;
+    });
+    setRepeatRange((prev) => {
+      if (!prev) return null;
+      if (prev.start >= newTotal) return null;
+      return { start: prev.start, end: Math.min(prev.end, newTotal - 1) };
+    });
   }, [beatsPerBar, subdivision, tracks]);
 
   const handleSetBeatsPerBar = useCallback((newBeats: number) => {
     const newTotal = bars * newBeats * subdivision;
     setBeatsPerBar(newBeats);
     setSteps((prev) => resizeStepsForGrid(prev, tracks, newTotal));
+    setRhythmOverrides({});
+    setRepeatRange(null);
     setSelectedSteps(new Set<number>());
   }, [bars, subdivision, tracks]);
 
   const handleSetSubdivision = useCallback((newSub: number) => {
-    const newTotal = bars * beatsPerBar * newSub;
     setSubdivision(newSub);
-    setSteps((prev) => resizeStepsForGrid(prev, tracks, newTotal));
+    setSteps((prev) => remapStepsForSubdivision(prev, tracks, bars, beatsPerBar, subdivision, newSub));
+    setRhythmOverrides((prev) => {
+      const next: Record<string, Record<number, number>> = {};
+      for (const track of tracks) {
+        const overrides = prev[track.id] ?? {};
+        const filtered: Record<number, number> = {};
+        for (const [barIndex, value] of Object.entries(overrides)) {
+          const v = Math.min(newSub, value);
+          if (v !== newSub) filtered[Number(barIndex)] = v;
+        }
+        if (Object.keys(filtered).length > 0) next[track.id] = filtered;
+      }
+      return next;
+    });
+    setRepeatRange(null);
     setSelectedSteps(new Set<number>());
-  }, [bars, beatsPerBar, tracks]);
+  }, [bars, beatsPerBar, subdivision, tracks]);
+
+  const toggleTrackSelection = useCallback((trackId: string, e: React.MouseEvent) => {
+    e.preventDefault();
+    setSelectedTrackIds((prev) => {
+      const next = new Set(prev);
+      if (e.ctrlKey || e.metaKey) {
+        if (next.has(trackId)) next.delete(trackId);
+        else next.add(trackId);
+      } else {
+        next.clear();
+        next.add(trackId);
+      }
+      return next;
+    });
+  }, []);
+
+  const applyRhythmToSelection = useCallback((newSub: number) => {
+    if (selectedSteps.size === 0) return;
+    const barIndices = Array.from(new Set(Array.from(selectedSteps).map((step) => Math.floor(step / stepsPerBar))));
+    setRhythmOverrides((prev) => {
+      const next: Record<string, Record<number, number>> = { ...prev };
+      for (const trackId of effectiveTrackIds) {
+        const overrides = { ...(next[trackId] ?? {}) };
+        for (const barIndex of barIndices) {
+          if (newSub === subdivision) delete overrides[barIndex];
+          else overrides[barIndex] = newSub;
+        }
+        if (Object.keys(overrides).length > 0) next[trackId] = overrides;
+        else delete next[trackId];
+      }
+      return next;
+    });
+  }, [selectedSteps, stepsPerBar, effectiveTrackIds, subdivision]);
+
+  const setRepeatFromSelection = useCallback(() => {
+    if (selectedSteps.size === 0) return;
+    const sorted = Array.from(selectedSteps).sort((a, b) => a - b);
+    setRepeatRange({ start: sorted[0], end: sorted[sorted.length - 1] });
+  }, [selectedSteps]);
 
   const resetProject = useCallback(() => {
     if (!confirm("Reset everything to defaults? This cannot be undone.")) return;
@@ -493,9 +643,65 @@ export default function DAW() {
     setSubdivision(p.subdivision);
     setBars(p.bars);
     setSteps(p.steps);
+    setRhythmOverrides(p.rhythmOverrides ?? {});
+    setRepeatRange(null);
+    setSelectedTrackIds(new Set<string>(p.tracks.map((t) => t.id)));
     setSelectedSteps(new Set<number>());
     setClipboard(null);
     lastSelectedStepRef.current = null;
+  }, [stopPlayback]);
+
+  const exportProject = useCallback(() => {
+    const payload: DAWProject = { bpm, beatsPerBar, noteValue, subdivision, bars, tracks, steps, rhythmOverrides, masterVolume };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "taikodaw-project.tkdaw.json";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }, [bpm, beatsPerBar, noteValue, subdivision, bars, tracks, steps, rhythmOverrides, masterVolume]);
+
+  const importProjectFile = useCallback(async (file: File) => {
+    try {
+      const raw = await file.text();
+      const parsed = JSON.parse(raw) as Partial<DAWProject>;
+      if (!parsed || !Array.isArray(parsed.tracks) || typeof parsed.bpm !== "number" || typeof parsed.bars !== "number") {
+        alert("Invalid TaikoDaw file.");
+        return;
+      }
+      const nextTracks = parsed.tracks.map((t, idx) => ({
+        id: t.id ?? `imported-${idx}-${Date.now()}`,
+        name: t.name ?? `Part ${idx + 1}`,
+        volume: clamp(t.volume ?? 80, 0, 100),
+        muted: Boolean(t.muted),
+      }));
+      const nextBeatsPerBar = clamp(parsed.beatsPerBar ?? 4, 2, 8);
+      const nextSubdivision = [1, 2, 4].includes(parsed.subdivision ?? 4) ? (parsed.subdivision ?? 4) : 4;
+      const nextBars = clamp(parsed.bars, 1, 16);
+      const nextTotal = nextBars * nextBeatsPerBar * nextSubdivision;
+      const nextSteps = resizeStepsForGrid((parsed.steps ?? {}) as Record<string, Hit[]>, nextTracks, nextTotal);
+
+      stopPlayback();
+      setBpm(clamp(parsed.bpm ?? 120, 20, 320));
+      setNoteValue([2, 4, 8].includes(parsed.noteValue ?? 4) ? (parsed.noteValue ?? 4) : 4);
+      setMasterVolume(clamp(parsed.masterVolume ?? 80, 0, 100));
+      setTracks(nextTracks);
+      setBeatsPerBar(nextBeatsPerBar);
+      setSubdivision(nextSubdivision);
+      setBars(nextBars);
+      setSteps(nextSteps);
+      setRhythmOverrides(parsed.rhythmOverrides ?? {});
+      setRepeatRange(null);
+      setSelectedTrackIds(new Set(nextTracks.map((t) => t.id)));
+      setSelectedSteps(new Set<number>());
+      setClipboard(null);
+      lastSelectedStepRef.current = null;
+    } catch {
+      alert("Could not import file.");
+    }
   }, [stopPlayback]);
 
   const getBarSelectionState = (barIndex: number): "none" | "partial" | "full" => {
@@ -508,6 +714,10 @@ export default function DAW() {
     if (count === stepsPerBar) return "full";
     return "partial";
   };
+  const isStepEditable = useCallback((trackId: string, stepIndex: number) => {
+    const skip = getTrackOverrideStep(trackId, stepIndex, stepsPerBar, rhythmOverrides, subdivision);
+    return skip <= 1 || stepIndex % skip === 0;
+  }, [stepsPerBar, rhythmOverrides, subdivision]);
 
   const rulerCells: { label: string; width: number }[] = [];
   for (let b = 0; b < bars; b++) {
@@ -568,6 +778,27 @@ export default function DAW() {
           <span className="text-xs text-gray-400 uppercase tracking-wider font-semibold">Bars</span>
           <input type="number" min={1} max={16} value={bars} onChange={(e) => handleSetBars(Number(e.target.value))} className="w-12 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm text-center text-white" />
         </label>
+        <div className="flex items-center gap-2">
+          <button onClick={setRepeatFromSelection} disabled={!hasSelection} className={`px-2.5 py-1 border rounded text-xs transition-colors ${hasSelection ? "bg-violet-800 hover:bg-violet-700 border-violet-600 text-violet-100" : "bg-gray-800 border-gray-700 text-gray-500 cursor-not-allowed"}`} title="Repeat only selected span">Repeat Selection</button>
+          {repeatRange && <button onClick={() => setRepeatRange(null)} className="px-2.5 py-1 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded text-xs text-gray-300 transition-colors" title="Clear repeat span">Clear Repeat</button>}
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={exportProject} className="px-2.5 py-1 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded text-xs text-gray-300 transition-colors" title="Save as TaikoDaw file">Export</button>
+          <button onClick={() => importInputRef.current?.click()} className="px-2.5 py-1 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded text-xs text-gray-300 transition-colors" title="Load TaikoDaw file">Import</button>
+          <input
+            ref={importInputRef}
+            type="file"
+            accept=".json,.tkdaw.json,application/json"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) {
+                void importProjectFile(file);
+              }
+              e.currentTarget.value = "";
+            }}
+          />
+        </div>
         <div className="flex items-center gap-2 ml-auto">
           <span className="text-xs text-gray-400 uppercase tracking-wider font-semibold">Master</span>
           <input type="range" min={0} max={100} value={masterVolume} onChange={(e) => setMasterVolume(Number(e.target.value))} className="w-28 cursor-pointer" style={{ accentColor: "#a855f7" }} />
@@ -580,7 +811,17 @@ export default function DAW() {
         <div className="bg-gray-900 border-b border-teal-900 px-5 py-2 flex flex-wrap items-center gap-3" onClick={(e) => e.stopPropagation()}>
           <span className="text-xs text-teal-400 font-semibold uppercase tracking-wider">Selection</span>
           {hasSelection && <span className="text-xs text-gray-500">{selectedSteps.size} step{selectedSteps.size !== 1 ? "s" : ""} selected</span>}
+          <span className="text-xs text-indigo-400">{effectiveTrackIds.length} part{effectiveTrackIds.length !== 1 ? "s" : ""} active</span>
           <button onClick={handleSelectEmptyBars} className="px-3 py-1 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded text-xs text-gray-300 hover:text-white transition-colors" title="Select all bars with no hits in any track">Select Empty Bars</button>
+          {hasSelection && (
+            <select onChange={(e) => applyRhythmToSelection(Number(e.target.value))} defaultValue="" className="px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200">
+              <option value="" disabled>Set rhythm for selected bar(s)</option>
+              <option value={subdivision}>Use global grid</option>
+              {[1,2,4].filter((n) => n <= subdivision).map((n) => (
+                <option key={n} value={n}>{n === 1 ? "Quarter notes" : n === 2 ? "Eighth notes" : "Sixteenth notes"}</option>
+              ))}
+            </select>
+          )}
           {hasSelection && <button onClick={handleCopy} className="px-3 py-1 bg-teal-800 hover:bg-teal-700 border border-teal-600 rounded text-xs text-teal-100 transition-colors" title="Copy selected steps">Copy</button>}
           {hasClipboard && hasSelection && <button onClick={handlePaste} className="px-3 py-1 bg-teal-700 hover:bg-teal-600 border border-teal-500 rounded text-xs text-white transition-colors" title={`Paste ${clipboard.count} copied step${clipboard.count !== 1 ? "s" : ""} into selection`}>Paste ({clipboard.count} step{clipboard.count !== 1 ? "s" : ""})</button>}
           {hasSelection && <button onClick={handleClearSelection} className="px-3 py-1 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded text-xs text-gray-400 hover:text-gray-200 transition-colors">Clear Selection</button>}
@@ -601,7 +842,7 @@ export default function DAW() {
                     <div
                       key={barIdx}
                       style={{ width: barHeaderWidth, marginLeft: barIdx > 0 ? 12 : 0 }}
-                      className={`px-1 py-0.5 text-xs rounded cursor-pointer transition-colors text-center font-semibold border select-none ${state === "full" ? "bg-teal-700 text-teal-100 border-teal-500" : state === "partial" ? "bg-teal-900/60 text-teal-300 border-teal-700" : "bg-gray-800 text-gray-500 hover:bg-gray-700 hover:text-gray-300 border-gray-700"}`}
+                      className={`px-1 py-0.5 text-xs rounded cursor-pointer transition-colors text-center font-semibold border select-none ${repeatRange && barIdx >= Math.floor(repeatRange.start / stepsPerBar) && barIdx <= Math.floor(repeatRange.end / stepsPerBar) ? "ring-1 ring-violet-500" : ""} ${state === "full" ? "bg-teal-700 text-teal-100 border-teal-500" : state === "partial" ? "bg-teal-900/60 text-teal-300 border-teal-700" : "bg-gray-800 text-gray-500 hover:bg-gray-700 hover:text-gray-300 border-gray-700"}`}
                       onClick={(e) => handleBarClick(barIdx, e)}
                       title={`Click to select bar ${barIdx + 1} \u00b7 Ctrl+click to toggle \u00b7 Shift+click to extend`}
                     >
@@ -638,10 +879,13 @@ export default function DAW() {
                 beatsPerBar={beatsPerBar}
                 subdivision={subdivision}
                 selectedSteps={selectedSteps}
+                isTrackSelected={selectedTrackIds.has(track.id)}
                 onUpdateTrack={(updates) => updateTrack(track.id, updates)}
                 onRemoveTrack={() => removeTrack(track.id)}
+                onToggleTrackSelection={(e) => toggleTrackSelection(track.id, e)}
                 onStepClick={(stepIndex, e) => handleStepClick(track.id, stepIndex, e)}
                 onContextMenu={(stepIndex, e) => setContextMenu({ trackId: track.id, stepIndex, x: e.clientX, y: e.clientY })}
+                isStepEditable={(stepIndex) => isStepEditable(track.id, stepIndex)}
               />
             );
           })}
@@ -696,9 +940,11 @@ export default function DAW() {
       <footer className="bg-gray-900 border-t border-gray-800 px-5 py-2 text-xs text-gray-600 flex flex-wrap gap-x-4 gap-y-1">
         <span>Left-click step: cycle DON \u2192 KA \u2192 empty</span>
         <span>Ctrl+click / Shift+click: select steps</span>
+        <span>Part button: choose specific part(s) for copy/paste + rhythm edits</span>
         <span>Click bar header: select whole bar</span>
+        <span>Repeat Selection: loop only a chosen bar/span</span>
         <span>Right-click active step: volume &amp; DON position</span>
-        <span className="ml-auto">Auto-saved in browser</span>
+        <span className="ml-auto">Auto-saved in browser · Export/Import .tkdaw.json</span>
       </footer>
     </div>
   );

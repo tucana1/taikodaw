@@ -21,6 +21,7 @@ export interface DAWProject {
   bars: number;
   tracks: Track[];
   steps: Record<string, Hit[]>; // trackId -> flat step array
+  rhythmOverrides?: Record<string, Record<number, number>>; // trackId -> barIndex -> subdivision override
   masterVolume: number; // 0-100
 }
 
@@ -37,6 +38,7 @@ export function makeDefaultProject(): DAWProject {
     bars: 2,
     tracks: [{ id: "default-track-1", name: "Part 1", volume: 80, muted: false }],
     steps: { "default-track-1": makeSteps(2 * 4 * 4) },
+    rhythmOverrides: {},
     masterVolume: 80,
   };
 }
