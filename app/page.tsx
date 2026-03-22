@@ -1,5 +1,5 @@
-import DAW from "@/components/DAW";
+import ClientPage from "./ClientPage";
 
 export default function Home() {
-  return <DAW />;
+  return <ClientPage />;
 }

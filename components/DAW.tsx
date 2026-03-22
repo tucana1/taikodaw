@@ -30,10 +30,11 @@ const TRACK_COLORS = [
 
 // ─── Module-level helpers ─────────────────────────────────────────────────────
 
-let trackCounter = 2;
+// Starts at 2 because the default project already has "Part 1"
+let nextTrackNumber = 2;
 
 function generateId(): string {
-  return `track-${Date.now()}-${(trackCounter++).toString(36)}`;
+  return `track-${Date.now()}-${(nextTrackNumber++).toString(36)}`;
 }
 
 function cycleHit(type: HitType): HitType {
@@ -44,6 +45,11 @@ function cycleHit(type: HitType): HitType {
 
 function clamp(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, n));
+}
+
+/** Duration in seconds of one grid step at the given BPM and subdivision. */
+function calcSecPerStep(bpm: number, subdivision: number): number {
+  return 60 / bpm / subdivision;
 }
 
 /** Returns the persisted project if on client, otherwise default. */
@@ -353,8 +359,7 @@ export default function DAW() {
   const scheduler = useCallback(() => {
     if (!isPlayingRef.current) return;
     const ctx = getAudioContext();
-    const secPerStep =
-      60 / bpmRef.current / subdivisionRef.current;
+    const secPerStep = calcSecPerStep(bpmRef.current, subdivisionRef.current);
     const total = totalStepsRef.current;
 
     while (nextStepTimeRef.current < ctx.currentTime + LOOKAHEAD_S) {

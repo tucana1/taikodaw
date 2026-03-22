@@ -23,7 +23,7 @@ export interface DAWProject {
   masterVolume: number; // 0-100
 }
 
-function makeSteps(count: number): Hit[] {
+export function makeSteps(count: number): Hit[] {
   return Array.from({ length: count }, () => ({ type: null, volume: 80 } as Hit));
 }
 
@@ -39,5 +39,3 @@ export function makeDefaultProject(): DAWProject {
     masterVolume: 80,
   };
 }
-
-export { makeSteps };
